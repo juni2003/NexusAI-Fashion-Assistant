@@ -11,7 +11,7 @@ All Supabase interactions live here.
 
 import os
 from supabase import create_client, Client
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,12 +32,12 @@ def get_supabase() -> Client:
 
 # ── Singleton: Embedding model ────────────────────────────────────────────────
 # Loaded once at startup — same model used during ingestion, so vectors are compatible.
-_embed_model: SentenceTransformer | None = None
+_embed_model: TextEmbedding | None = None
 
-def get_embed_model() -> SentenceTransformer:
+def get_embed_model() -> TextEmbedding:
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        _embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return _embed_model
 
 
@@ -46,7 +46,8 @@ def get_embed_model() -> SentenceTransformer:
 def embed_query(text: str) -> list[float]:
     """Convert a user query string into a 384-dim vector."""
     model = get_embed_model()
-    return model.encode(text, normalize_embeddings=True).tolist()
+    embeddings = list(model.embed([text]))
+    return embeddings[0].tolist()
 
 
 def search_products(query_embedding: list[float], top_k: int = 15) -> list[dict]:
