@@ -10,7 +10,7 @@
 [![Groq](https://img.shields.io/badge/Groq-Llama--3-F55036?style=flat-square)](https://groq.com/)
 [![Supabase](https://img.shields.io/badge/Supabase-pgvector-3ECF8E?style=flat-square&logo=supabase)](https://supabase.com/)
 [![Deployed on Vercel](https://img.shields.io/badge/Frontend-Vercel-black?style=flat-square&logo=vercel)](https://vercel.com/)
-[![Deployed on HuggingFace](https://img.shields.io/badge/Backend-HuggingFace%20Spaces-FFD21E?style=flat-square&logo=huggingface)](https://huggingface.co/spaces)
+[![Deployed on Render](https://img.shields.io/badge/Backend-Render-46E3B7?style=flat-square&logo=render)](https://render.com)
 
 **A production-grade, intelligent fashion assistant powered by LangGraph agentic routing, semantic vector search, and Groq's blazing-fast inference.**
 
@@ -40,7 +40,7 @@ User Browser (Next.js on Vercel)
     │
     │  POST /chat (SSE Stream)
     ▼
-FastAPI Backend (Hugging Face Spaces - Docker)
+FastAPI Backend (Render Web Service)
     │
     ├── LangGraph Agent (Router Node)
     │       ├── SALES   → Supabase pgvector search → FlashRank reranker → Groq LLM
@@ -65,7 +65,7 @@ FastAPI Backend (Hugging Face Spaces - Docker)
 | **Reranker** | FlashRank (local Python) | In-process semantic reranking, unlimited & free |
 | **Backend API** | FastAPI + Uvicorn | REST + SSE streaming server |
 | **Frontend Host** | Vercel | Global CDN, free hobby tier |
-| **Backend Host** | Hugging Face Spaces | Docker runtime, free, no cold starts |
+| **Backend Host** | Render | Free Web Service tier |
 
 ---
 
@@ -106,12 +106,18 @@ App live at `http://localhost:3000`.
 
 ## 🌐 Deployment (100% Free)
 
-### Backend → Hugging Face Spaces
-1. Go to [huggingface.co/spaces](https://huggingface.co/spaces) → **Create new Space**
-2. SDK: **Docker** | Template: **Blank** | Visibility: **Public**
-3. Upload all files from `backend/` (including `Dockerfile`). **Do NOT upload `.env`.**
-4. In **Settings → Variables and secrets**, add: `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`
-5. Wait for build → copy your Space URL.
+### Backend → Render
+1. Go to [render.com](https://render.com) → **New +** → **Web Service**
+2. Connect your GitHub account and select the `NexusAI-Fashion-Assistant` repository.
+3. Configure the deployment:
+   - **Root Directory:** `backend`
+   - **Environment:** `Python`
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+4. Expand **Advanced** and add your Environment Variables:
+   - `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`
+   - Add `PYTHON_VERSION` and set it to `3.11.0`
+5. Click **Create Web Service**. Wait for the build to finish and copy your Render URL (e.g., `https://nexusai-backend.onrender.com`).
 
 ### Frontend → Vercel
 1. Go to [vercel.com](https://vercel.com) → **Add New Project** → import `nexusai` from GitHub
@@ -128,7 +134,7 @@ App live at `http://localhost:3000`.
 ```
 nexusai/
 ├── backend/
-│   ├── Dockerfile         # HuggingFace Spaces container config
+│   ├── Dockerfile         # (Optional) Container config
 │   ├── main.py            # FastAPI entry point + /chat SSE endpoint
 │   ├── graph.py           # LangGraph agent workflow
 │   ├── database.py        # Supabase pgvector query helpers
