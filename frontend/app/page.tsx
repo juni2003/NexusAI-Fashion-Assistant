@@ -385,7 +385,14 @@ export default function HomePage() {
             </div>
             <span className="text-sm text-slate-400">
               NexusAI — Built by{" "}
-              <span className="text-white font-medium">juni2003</span>
+              <a 
+                href="https://github.com/juni2003" 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="text-white font-medium hover:text-indigo-400 transition-colors"
+              >
+                juni2003
+              </a>
             </span>
           </div>
           <p className="text-slate-500 text-sm">
