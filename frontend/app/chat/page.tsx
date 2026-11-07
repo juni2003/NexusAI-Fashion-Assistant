@@ -7,11 +7,23 @@ import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { ChatSidebar } from "@/components/chat/chat-sidebar";
 import { cn } from "@/lib/utils";
 import { sendMessage, type ChatMessage, type Product } from "@/lib/chat-api";
 import {
+  createId,
+  createSession,
+  deriveTitle,
+  loadSessions,
+  saveSessions,
+  sortSessions,
+  type ChatSession,
+  type UIMessage,
+} from "@/lib/chat-sessions";
+import {
   ArrowUpIcon,
   ArrowLeft,
+  Menu,
   Sparkles,
   ShoppingBag,
   Undo2,
@@ -22,15 +34,8 @@ import {
   Loader2,
 } from "lucide-react";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-interface UIMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  products?: Product[];
-  route?: string;
-  isStreaming?: boolean;
-}
+// Stable reference reused when there is no active session (keeps effect deps stable).
+const EMPTY_MESSAGES: UIMessage[] = [];
 
 // ── Auto-resize hook ──────────────────────────────────────────────────────────
 function useAutoResizeTextarea(minHeight: number, maxHeight: number) {
@@ -259,16 +264,41 @@ function MessageBubble({ message }: { message: UIMessage }) {
 
 // ── Main Chat Page ────────────────────────────────────────────────────────────
 export default function ChatPage() {
-  const [messages, setMessages] = useState<UIMessage[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [suggestedQuestions, setSuggestedQuestions] = useState<typeof ALL_QUESTIONS>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { textareaRef, adjustHeight } = useAutoResizeTextarea(48, 150);
 
+  const activeSession = sessions.find((s) => s.id === activeId);
+  const messages = activeSession?.messages ?? EMPTY_MESSAGES;
+
+  // Hydrate sessions from localStorage on mount (never during SSR).
+  // Reading browser-only storage must happen after mount to avoid a server/
+  // client hydration mismatch, so the state update has to live in this effect.
+  useEffect(() => {
+    const stored = loadSessions();
+    const initial = stored.length > 0 ? sortSessions(stored) : [createSession()];
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSessions(initial);
+    setActiveId(initial[0].id);
+    setHydrated(true);
+  }, []);
+
+  // Persist whenever the sessions change (after hydration).
+  useEffect(() => {
+    if (hydrated) saveSessions(sessions);
+  }, [sessions, hydrated]);
+
   // Pick 6 random questions on load
   useEffect(() => {
     const shuffled = [...ALL_QUESTIONS].sort(() => 0.5 - Math.random());
+    // Random selection must not run during SSR, so it happens after mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSuggestedQuestions(shuffled.slice(0, 6));
   }, []);
 
@@ -277,26 +307,77 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Build chat history for API
-  const buildChatHistory = (): ChatMessage[] => {
-    return messages
+  // Update the messages of one specific session (used by streaming callbacks).
+  const patchSession = useCallback(
+    (id: string, fn: (msgs: UIMessage[]) => UIMessage[]) => {
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? { ...s, messages: fn(s.messages), updatedAt: Date.now() }
+            : s
+        )
+      );
+    },
+    []
+  );
+
+  // Build chat history for the API from a given session.
+  const buildChatHistory = (id: string): ChatMessage[] => {
+    const session = sessions.find((s) => s.id === id);
+    if (!session) return [];
+    return session.messages
       .filter((m) => !m.isStreaming)
       .slice(-10) // last 5 turns
       .map((m) => ({ role: m.role, content: m.content }));
   };
 
+  // ── Session manager actions ───────────────────────────────────────────────
+  const handleNewChat = () => {
+    const session = createSession();
+    setSessions((prev) => [session, ...prev]);
+    setActiveId(session.id);
+    setSidebarOpen(false);
+  };
+
+  const handleSelectSession = (id: string) => {
+    setActiveId(id);
+    setSidebarOpen(false);
+  };
+
+  const handleRenameSession = (id: string, title: string) => {
+    const clean = title.trim();
+    if (!clean) return;
+    setSessions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, title: clean } : s))
+    );
+  };
+
+  const handleDeleteSession = (id: string) => {
+    const remaining = sessions.filter((s) => s.id !== id);
+    if (remaining.length === 0) {
+      // Always keep one session so there is something to chat in.
+      const fresh = createSession();
+      setSessions([fresh]);
+      setActiveId(fresh.id);
+      return;
+    }
+    setSessions(remaining);
+    if (id === activeId) setActiveId(sortSessions(remaining)[0].id);
+  };
+
   // Handle sending a message
   const handleSend = async (text?: string) => {
     const messageText = text || input.trim();
-    if (!messageText || isLoading) return;
+    if (!messageText || isLoading || !activeId) return;
 
+    const sessionId = activeId;
     const userMsg: UIMessage = {
-      id: Date.now().toString(),
+      id: createId(),
       role: "user",
       content: messageText,
     };
 
-    const aiMsgId = (Date.now() + 1).toString();
+    const aiMsgId = createId();
     const aiMsg: UIMessage = {
       id: aiMsgId,
       role: "assistant",
@@ -304,43 +385,56 @@ export default function ChatPage() {
       isStreaming: true,
     };
 
-    setMessages((prev) => [...prev, userMsg, aiMsg]);
+    const isFirstUserMessage = !sessions
+      .find((s) => s.id === sessionId)
+      ?.messages.some((m) => m.role === "user");
+
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === sessionId
+          ? {
+              ...s,
+              title: isFirstUserMessage ? deriveTitle(messageText) : s.title,
+              messages: [...s.messages, userMsg, aiMsg],
+              updatedAt: Date.now(),
+            }
+          : s
+      )
+    );
     setInput("");
     adjustHeight(true);
     setIsLoading(true);
 
-    const chatHistory = buildChatHistory();
+    const chatHistory = buildChatHistory(sessionId);
 
     await sendMessage(
       messageText,
       chatHistory,
       // onTextChunk
       (chunk) => {
-        setMessages((prev) =>
-          prev.map((m) =>
+        patchSession(sessionId, (msgs) =>
+          msgs.map((m) =>
             m.id === aiMsgId ? { ...m, content: m.content + chunk } : m
           )
         );
       },
       // onProducts
       (products) => {
-        setMessages((prev) =>
-          prev.map((m) => (m.id === aiMsgId ? { ...m, products } : m))
+        patchSession(sessionId, (msgs) =>
+          msgs.map((m) => (m.id === aiMsgId ? { ...m, products } : m))
         );
       },
       // onDone
       (route) => {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === aiMsgId ? { ...m, isStreaming: false, route } : m
-          )
+        patchSession(sessionId, (msgs) =>
+          msgs.map((m) => (m.id === aiMsgId ? { ...m, isStreaming: false, route } : m))
         );
         setIsLoading(false);
       },
       // onError
       (error) => {
-        setMessages((prev) =>
-          prev.map((m) =>
+        patchSession(sessionId, (msgs) =>
+          msgs.map((m) =>
             m.id === aiMsgId
               ? { ...m, content: `⚠️ ${error}`, isStreaming: false }
               : m
@@ -361,13 +455,27 @@ export default function ChatPage() {
   const isEmpty = messages.length === 0;
 
   return (
-    <div className="relative w-full h-screen flex flex-col">
+    <div className="relative flex h-screen w-full overflow-hidden">
       {/* Background */}
       <div className="fixed inset-0 -z-10">
         <div className="absolute top-[-15%] right-[-10%] w-[500px] h-[500px] rounded-full bg-violet-600/15 blur-[100px]" />
         <div className="absolute bottom-[-10%] left-[-5%] w-[400px] h-[400px] rounded-full bg-indigo-600/10 blur-[80px]" />
       </div>
 
+      {/* Session sidebar */}
+      <ChatSidebar
+        sessions={sessions}
+        activeId={activeId}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onNewChat={handleNewChat}
+        onSelect={handleSelectSession}
+        onRename={handleRenameSession}
+        onDelete={handleDeleteSession}
+      />
+
+      {/* Main column */}
+      <div className="flex h-screen min-w-0 flex-1 flex-col">
       {/* Header */}
       <motion.header
         initial={{ opacity: 0, y: -20 }}
@@ -375,6 +483,14 @@ export default function ChatPage() {
         className="glass-strong px-6 py-4 flex items-center justify-between z-10"
       >
         <div className="flex items-center gap-4">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open chat history"
+            className="w-9 h-9 rounded-full glass flex items-center justify-center hover:bg-white/10 transition-colors md:hidden"
+          >
+            <Menu className="w-4 h-4 text-white" />
+          </button>
           <Link
             href="/"
             className="w-9 h-9 rounded-full glass flex items-center justify-center hover:bg-white/10 transition-colors"
@@ -501,6 +617,7 @@ export default function ChatPage() {
           </div>
 
         </div>
+      </div>
       </div>
     </div>
   );
