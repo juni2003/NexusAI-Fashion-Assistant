@@ -1,13 +1,13 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import Link from "next/link";
-import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { ChatSidebar } from "@/components/chat/chat-sidebar";
+import { ExportMenu } from "@/components/chat/export-menu";
 import { cn } from "@/lib/utils";
 import { sendMessage, type ChatMessage, type Product } from "@/lib/chat-api";
 import {
@@ -15,17 +15,22 @@ import {
   createSession,
   deriveTitle,
   loadSessions,
+  mergeProducts,
   saveSessions,
   sortSessions,
   type ChatSession,
+  type MessageStatus,
   type UIMessage,
 } from "@/lib/chat-sessions";
 import {
+  AlertCircle,
   ArrowUpIcon,
   ArrowLeft,
   Menu,
+  RotateCcw,
   Sparkles,
   ShoppingBag,
+  Square,
   Undo2,
   DollarSign,
   Shirt,
@@ -36,6 +41,10 @@ import {
 
 // Stable reference reused when there is no active session (keeps effect deps stable).
 const EMPTY_MESSAGES: UIMessage[] = [];
+
+// Long conversations render in windows so the DOM stays small.
+const INITIAL_WINDOW = 30;
+const WINDOW_STEP = 30;
 
 // ── Auto-resize hook ──────────────────────────────────────────────────────────
 function useAutoResizeTextarea(minHeight: number, maxHeight: number) {
@@ -159,31 +168,40 @@ function ProductCard({ product }: { product: Product }) {
   );
 }
 
-// ── Typewriter Effect ─────────────────────────────────────────────────────────
-function TypewriterEffect({ text, isStreaming }: { text: string; isStreaming?: boolean }) {
-  const [displayedText, setDisplayedText] = useState("");
+// ── Streaming text animation ──────────────────────────────────────────────────
+// Animates only while a response is streaming: once it settles the full text is
+// rendered at once, so restored or long histories do no per-frame work.
+function TypewriterEffect({
+  text,
+  isStreaming,
+}: {
+  text: string;
+  isStreaming?: boolean;
+}) {
+  const [displayedText, setDisplayedText] = useState(isStreaming ? "" : text);
   const targetTextRef = useRef(text);
 
   useEffect(() => {
     targetTextRef.current = text;
-  }, [text]);
+    // Catch up immediately when the stream ends (or for restored messages).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (!isStreaming) setDisplayedText(text);
+  }, [text, isStreaming]);
 
   useEffect(() => {
+    if (!isStreaming) return undefined;
     const interval = setInterval(() => {
       setDisplayedText((prev) => {
         const target = targetTextRef.current;
-        if (prev.length < target.length) {
-          // Realistic typing speed: max 2 chars per tick
-          const remaining = target.length - prev.length;
-          const step = remaining > 30 ? 2 : 1;
-          return target.slice(0, prev.length + step);
-        }
-        return prev;
+        if (prev.length >= target.length) return prev;
+        const remaining = target.length - prev.length;
+        return target.slice(0, prev.length + (remaining > 30 ? 2 : 1));
       });
-    }, 25); // Slower interval to ensure the typing is noticeable
-
+    }, 25);
     return () => clearInterval(interval);
-  }, []);
+  }, [isStreaming]);
+
+  const showCursor = !!isStreaming || displayedText.length < text.length;
 
   return (
     <div className="markdown-content">
@@ -197,15 +215,48 @@ function TypewriterEffect({ text, isStreaming }: { text: string; isStreaming?: b
       >
         {displayedText}
       </ReactMarkdown>
-      {(isStreaming || displayedText.length < text.length) && (
-        <span className="typing-cursor ml-1" />
-      )}
+      {showCursor && <span className="typing-cursor ml-1" />}
     </div>
   );
 }
 
+// ── Thinking indicator ────────────────────────────────────────────────────────
+function ThinkingDots() {
+  return (
+    <span className="inline-flex items-center gap-1" aria-label="NexusAI is thinking">
+      {[0, 150, 300].map((delay) => (
+        <span
+          key={delay}
+          className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400"
+          style={{ animationDelay: `${delay}ms` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 // ── Message Bubble Component ──────────────────────────────────────────────────
-function MessageBubble({ message }: { message: UIMessage }) {
+interface MessageBubbleProps {
+  message: UIMessage;
+  onRetry: (messageId: string) => void;
+  retryDisabled?: boolean;
+}
+
+function messageStatus(message: UIMessage): MessageStatus {
+  if (message.status) return message.status;
+  return message.isStreaming ? "streaming" : "done";
+}
+
+const MessageBubble = memo(function MessageBubble({
+  message,
+  onRetry,
+  retryDisabled,
+}: MessageBubbleProps) {
+  const status = messageStatus(message);
+  const isStreaming = status === "streaming";
+  const isError = status === "error";
+  const isCancelled = status === "cancelled";
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 15 }}
@@ -215,29 +266,74 @@ function MessageBubble({ message }: { message: UIMessage }) {
         "max-w-[85%] sm:max-w-[75%] px-5 py-3.5",
         message.role === "user"
           ? "message-user self-end text-white"
-          : "message-ai self-start text-slate-200"
+          : "message-ai self-start text-slate-200",
+        isError && "ring-1 ring-red-500/30"
       )}
     >
       {/* Text Content */}
       <div className="text-sm sm:text-base leading-relaxed whitespace-pre-wrap">
         {message.role === "assistant" ? (
-          <TypewriterEffect text={message.content} isStreaming={message.isStreaming} />
+          message.content ? (
+            <TypewriterEffect text={message.content} isStreaming={isStreaming} />
+          ) : isStreaming ? (
+            <ThinkingDots />
+          ) : null
         ) : (
           message.content
         )}
       </div>
 
+      {/* Failure state with retry */}
+      {isError && (
+        <div
+          role="alert"
+          className="mt-2 flex flex-col gap-2 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <span className="flex items-start gap-2 text-xs text-red-200">
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            {message.error || "The response failed. Please try again."}
+          </span>
+          <button
+            type="button"
+            onClick={() => onRetry(message.id)}
+            disabled={retryDisabled}
+            className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-red-400/30 bg-red-500/15 px-2.5 py-1 text-xs font-medium text-red-100 transition-colors hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <RotateCcw className="h-3 w-3" />
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Cancelled state with retry */}
+      {isCancelled && (
+        <div className="mt-2 flex flex-col gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-xs text-slate-400">
+            {message.content ? "Response stopped." : "No response was received."}
+          </span>
+          <button
+            type="button"
+            onClick={() => onRetry(message.id)}
+            disabled={retryDisabled}
+            className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-white/15 px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <RotateCcw className="h-3 w-3" />
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Product Cards (Sales route) */}
       {message.products && message.products.length > 0 && (
         <div className="mt-4 -mx-1 flex gap-4 overflow-x-auto pb-2 scrollbar-thin">
           {message.products.map((product, i) => (
-            <ProductCard key={i} product={product} />
+            <ProductCard key={`${product.product_url || product.product_name}-${i}`} product={product} />
           ))}
         </div>
       )}
 
       {/* Route Badge */}
-      {message.route && !message.isStreaming && (
+      {message.route && !isStreaming && (
         <div className="mt-3 flex items-center gap-1.5">
           <div
             className={cn(
@@ -260,7 +356,7 @@ function MessageBubble({ message }: { message: UIMessage }) {
       )}
     </motion.div>
   );
-}
+});
 
 // ── Main Chat Page ────────────────────────────────────────────────────────────
 export default function ChatPage() {
@@ -269,13 +365,20 @@ export default function ChatPage() {
   const [hydrated, setHydrated] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
   const [suggestedQuestions, setSuggestedQuestions] = useState<typeof ALL_QUESTIONS>([]);
+  // Ids of sessions with a request currently in flight (may outlive the view).
+  const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set());
+  const [visibleCount, setVisibleCount] = useState(INITIAL_WINDOW);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // In-flight requests keyed by the session they belong to, so a stream keeps
+  // running (and stays cancellable) when the user opens another chat.
+  const activeRequestsRef = useRef<Map<string, AbortController>>(new Map());
   const { textareaRef, adjustHeight } = useAutoResizeTextarea(48, 150);
 
   const activeSession = sessions.find((s) => s.id === activeId);
   const messages = activeSession?.messages ?? EMPTY_MESSAGES;
+  const isLoading = activeId ? streamingIds.has(activeId) : false;
+  const isAnyStreaming = streamingIds.size > 0;
 
   // Hydrate sessions from localStorage on mount (never during SSR).
   // Reading browser-only storage must happen after mount to avoid a server/
@@ -302,10 +405,28 @@ export default function ChatPage() {
     setSuggestedQuestions(shuffled.slice(0, 6));
   }, []);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom. During streaming use an instant jump so the smooth
+  // animation is not restarted on every chunk.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    messagesEndRef.current?.scrollIntoView({
+      behavior: isLoading ? "auto" : "smooth",
+    });
+  }, [messages, activeId, isLoading]);
+
+  // Jump back to the tail when the visible conversation changes.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setVisibleCount(INITIAL_WINDOW);
+  }, [activeId]);
+
+  // Cancel every in-flight request if the page unmounts.
+  useEffect(() => {
+    const requests = activeRequestsRef.current;
+    return () => {
+      for (const controller of requests.values()) controller.abort();
+      requests.clear();
+    };
+  }, []);
 
   // Update the messages of one specific session (used by streaming callbacks).
   const patchSession = useCallback(
@@ -321,15 +442,28 @@ export default function ChatPage() {
     []
   );
 
-  // Build chat history for the API from a given session.
-  const buildChatHistory = (id: string): ChatMessage[] => {
-    const session = sessions.find((s) => s.id === id);
-    if (!session) return [];
-    return session.messages
-      .filter((m) => !m.isStreaming)
+  // Build chat history for the API: completed turns only, oldest ones dropped.
+  const buildChatHistory = (list: UIMessage[]): ChatMessage[] =>
+    list
+      .filter(
+        (m) =>
+          m.content.trim().length > 0 &&
+          !m.isStreaming &&
+          m.status !== "streaming" &&
+          m.status !== "error"
+      )
       .slice(-10) // last 5 turns
       .map((m) => ({ role: m.role, content: m.content }));
-  };
+
+  // Track which sessions currently have a request in flight.
+  const setStreaming = useCallback((id: string, busy: boolean) => {
+    setStreamingIds((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
 
   // ── Session manager actions ───────────────────────────────────────────────
   const handleNewChat = () => {
@@ -353,6 +487,14 @@ export default function ChatPage() {
   };
 
   const handleDeleteSession = (id: string) => {
+    // Stop a stream running in this session so it cannot resurrect the chat.
+    const inFlight = activeRequestsRef.current.get(id);
+    if (inFlight) {
+      inFlight.abort();
+      activeRequestsRef.current.delete(id);
+      setStreaming(id, false);
+    }
+
     const remaining = sessions.filter((s) => s.id !== id);
     if (remaining.length === 0) {
       // Always keep one session so there is something to chat in.
@@ -365,29 +507,114 @@ export default function ChatPage() {
     if (id === activeId) setActiveId(sortSessions(remaining)[0].id);
   };
 
-  // Handle sending a message
+  /**
+   * Runs one assistant response for `sessionId` into the bubble `messageId`.
+   * Every callback patches the originating session by id, so switching chats
+   * while a response streams can never write into the wrong conversation.
+   */
+  const runStream = useCallback(
+    async (
+      sessionId: string,
+      messageId: string,
+      messageText: string,
+      history: ChatMessage[]
+    ) => {
+      const controller = new AbortController();
+      activeRequestsRef.current.set(sessionId, controller);
+      setStreaming(sessionId, true);
+
+      try {
+        await sendMessage(
+          messageText,
+          history,
+          // onTextChunk
+          (chunk) => {
+            patchSession(sessionId, (msgs) =>
+              msgs.map((m) =>
+                m.id === messageId ? { ...m, content: m.content + chunk } : m
+              )
+            );
+          },
+          // onProducts — merge so a retry never duplicates cards
+          (products) => {
+            patchSession(sessionId, (msgs) =>
+              msgs.map((m) =>
+                m.id === messageId
+                  ? { ...m, products: mergeProducts(m.products, products) }
+                  : m
+              )
+            );
+          },
+          // onDone
+          (route) => {
+            patchSession(sessionId, (msgs) =>
+              msgs.map((m) =>
+                m.id === messageId
+                  ? { ...m, isStreaming: false, status: "done", route }
+                  : m
+              )
+            );
+          },
+          // onError
+          (error) => {
+            patchSession(sessionId, (msgs) =>
+              msgs.map((m) =>
+                m.id === messageId
+                  ? { ...m, isStreaming: false, status: "error", error }
+                  : m
+              )
+            );
+          },
+          { signal: controller.signal }
+        );
+      } finally {
+        if (activeRequestsRef.current.get(sessionId) === controller) {
+          activeRequestsRef.current.delete(sessionId);
+        }
+        // An abort produces no callback, so settle the bubble here — unless a
+        // later callback already finished it.
+        if (controller.signal.aborted) {
+          patchSession(sessionId, (msgs) =>
+            msgs.map((m) =>
+              m.id === messageId &&
+              (m.status === "streaming" || m.isStreaming)
+                ? { ...m, isStreaming: false, status: "cancelled" }
+                : m
+            )
+          );
+        }
+        setStreaming(sessionId, false);
+      }
+    },
+    [patchSession, setStreaming]
+  );
+
+  // Handle sending a new message
   const handleSend = async (text?: string) => {
     const messageText = text || input.trim();
     if (!messageText || isLoading || !activeId) return;
 
     const sessionId = activeId;
+    const session = sessions.find((s) => s.id === sessionId);
+    if (!session) return;
+
     const userMsg: UIMessage = {
       id: createId(),
       role: "user",
       content: messageText,
+      status: "done",
     };
-
     const aiMsgId = createId();
     const aiMsg: UIMessage = {
       id: aiMsgId,
       role: "assistant",
       content: "",
       isStreaming: true,
+      status: "streaming",
     };
 
-    const isFirstUserMessage = !sessions
-      .find((s) => s.id === sessionId)
-      ?.messages.some((m) => m.role === "user");
+    const isFirstUserMessage = !session.messages.some((m) => m.role === "user");
+    const history = buildChatHistory(session.messages);
 
     setSessions((prev) =>
       prev.map((s) =>
@@ -403,47 +630,97 @@ export default function ChatPage() {
     );
     setInput("");
     adjustHeight(true);
-    setIsLoading(true);
 
-    const chatHistory = buildChatHistory(sessionId);
-
-    await sendMessage(
-      messageText,
-      chatHistory,
-      // onTextChunk
-      (chunk) => {
-        patchSession(sessionId, (msgs) =>
-          msgs.map((m) =>
-            m.id === aiMsgId ? { ...m, content: m.content + chunk } : m
-          )
-        );
-      },
-      // onProducts
-      (products) => {
-        patchSession(sessionId, (msgs) =>
-          msgs.map((m) => (m.id === aiMsgId ? { ...m, products } : m))
-        );
-      },
-      // onDone
-      (route) => {
-        patchSession(sessionId, (msgs) =>
-          msgs.map((m) => (m.id === aiMsgId ? { ...m, isStreaming: false, route } : m))
-        );
-        setIsLoading(false);
-      },
-      // onError
-      (error) => {
-        patchSession(sessionId, (msgs) =>
-          msgs.map((m) =>
-            m.id === aiMsgId
-              ? { ...m, content: `⚠️ ${error}`, isStreaming: false }
-              : m
-          )
-        );
-        setIsLoading(false);
-      }
-    );
+    await runStream(sessionId, aiMsgId, messageText, history);
   };
+
+  /**
+   * Retry a failed or cancelled turn in place. An assistant bubble re-sends its
+   * preceding user message; nothing is appended, so no message or product is
+   * duplicated.
+   */
+  const handleRetry = useCallback(
+    (messageId: string) => {
+      const sessionId = activeId;
+      if (!sessionId || streamingIds.has(sessionId)) return;
+      const session = sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+
+      const index = session.messages.findIndex((m) => m.id === messageId);
+      if (index === -1) return;
+      const target = session.messages[index];
+
+      if (target.role === "assistant") {
+        let userIndex = index - 1;
+        while (userIndex >= 0 && session.messages[userIndex].role !== "user") {
+          userIndex -= 1;
+        }
+        if (userIndex < 0) return;
+
+        const userText = session.messages[userIndex].content;
+        const history = buildChatHistory(session.messages.slice(0, userIndex));
+
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === target.id
+                      ? {
+                          ...m,
+                          content: "",
+                          products: undefined,
+                          route: undefined,
+                          error: undefined,
+                          isStreaming: true,
+                          status: "streaming",
+                        }
+                      : m
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : s
+          )
+        );
+
+        void runStream(sessionId, target.id, userText, history);
+        return;
+      }
+
+      // A failed user message is resent as a fresh turn.
+      const history = buildChatHistory(session.messages.slice(0, index));
+      const aiMsgId = createId();
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === sessionId
+            ? {
+                ...s,
+                messages: [
+                  ...s.messages,
+                  {
+                    id: aiMsgId,
+                    role: "assistant",
+                    content: "",
+                    isStreaming: true,
+                    status: "streaming",
+                  },
+                ],
+                updatedAt: Date.now(),
+              }
+            : s
+        )
+      );
+
+      void runStream(sessionId, aiMsgId, target.content, history);
+    },
+    [activeId, sessions, streamingIds, runStream]
+  );
+
+  // Cancel the active session's response.
+  const handleStop = useCallback(() => {
+    if (activeId) activeRequestsRef.current.get(activeId)?.abort();
+  }, [activeId]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -453,6 +730,10 @@ export default function ChatPage() {
   };
 
   const isEmpty = messages.length === 0;
+
+  // Only the newest messages are mounted; older ones load on demand.
+  const hiddenCount = Math.max(0, messages.length - visibleCount);
+  const visibleMessages = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
 
   return (
     <div className="relative flex h-screen w-full overflow-hidden">
@@ -472,6 +753,7 @@ export default function ChatPage() {
         onSelect={handleSelectSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
+        streamingIds={streamingIds}
       />
 
       {/* Main column */}
@@ -504,7 +786,11 @@ export default function ChatPage() {
             <div>
               <h1 className="text-white font-semibold text-sm">NexusAI</h1>
               <p className="text-slate-400 text-xs">
-                {isLoading ? "Thinking..." : "Online"}
+                {isLoading
+                  ? "Responding…"
+                  : isAnyStreaming
+                    ? "Responding in another chat…"
+                    : "Online"}
               </p>
             </div>
           </div>
@@ -513,6 +799,7 @@ export default function ChatPage() {
           {isLoading && (
             <Loader2 className="w-4 h-4 text-violet-400 animate-spin" />
           )}
+          <ExportMenu session={activeSession} />
         </div>
       </motion.header>
 
@@ -561,9 +848,26 @@ export default function ChatPage() {
             )}
           </AnimatePresence>
 
+          {/* Older messages are loaded on demand to keep the DOM small. */}
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setVisibleCount((count) => count + WINDOW_STEP)}
+              className="mx-auto rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-xs text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+            >
+              Show {Math.min(hiddenCount, WINDOW_STEP)} earlier message
+              {Math.min(hiddenCount, WINDOW_STEP) === 1 ? "" : "s"} ({hiddenCount} hidden)
+            </button>
+          )}
+
           {/* Message Bubbles */}
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
+          {visibleMessages.map((msg) => (
+            <MessageBubble
+              key={msg.id}
+              message={msg}
+              onRetry={handleRetry}
+              retryDisabled={isAnyStreaming}
+            />
           ))}
           <div ref={messagesEndRef} />
         </div>
@@ -595,24 +899,33 @@ export default function ChatPage() {
 
             <div className="flex items-center justify-between px-4 pb-3">
               <p className="text-slate-600 text-xs">
-                {isLoading ? "AI is responding..." : "Press Enter to send"}
+                {isLoading
+                  ? "AI is responding…"
+                  : "Press Enter to send · Shift+Enter for a new line"}
               </p>
-              <Button
-                onClick={() => handleSend()}
-                disabled={!input.trim() || isLoading}
-                className={cn(
-                  "rounded-xl px-4 py-2 transition-all duration-300",
-                  input.trim() && !isLoading
-                    ? "bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white shadow-lg shadow-violet-500/20"
-                    : "bg-white/5 text-slate-500 cursor-not-allowed"
-                )}
-              >
-                {isLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
+              {isLoading ? (
+                <Button
+                  onClick={handleStop}
+                  aria-label="Stop response"
+                  className="flex items-center rounded-xl bg-white/10 px-4 py-2 text-white transition-all duration-300 hover:bg-white/20"
+                >
+                  <Square className="h-3.5 w-3.5" />
+                  <span className="ml-2 text-xs">Stop</span>
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => handleSend()}
+                  disabled={!input.trim()}
+                  className={cn(
+                    "rounded-xl px-4 py-2 transition-all duration-300",
+                    input.trim()
+                      ? "bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white shadow-lg shadow-violet-500/20"
+                      : "bg-white/5 text-slate-500 cursor-not-allowed"
+                  )}
+                >
                   <ArrowUpIcon className="w-4 h-4" />
-                )}
-              </Button>
+                </Button>
+              )}
             </div>
           </div>
 

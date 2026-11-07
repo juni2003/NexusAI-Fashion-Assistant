@@ -7,13 +7,14 @@ import {
   MessageSquare,
   Pencil,
   Plus,
+  Search,
   Trash2,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   formatRelativeTime,
-  sortSessions,
+  searchSessions,
   type ChatSession,
 } from "@/lib/chat-sessions";
 
@@ -26,6 +27,8 @@ interface ChatSidebarProps {
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
+  /** Sessions with a response still streaming in the background. */
+  streamingIds?: Set<string>;
 }
 
 export function ChatSidebar({
@@ -37,13 +40,16 @@ export function ChatSidebar({
   onSelect,
   onRename,
   onDelete,
+  streamingIds,
 }: ChatSidebarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
+  const [query, setQuery] = useState("");
   const renameInputRef = useRef<HTMLInputElement>(null);
 
-  const ordered = sortSessions(sessions);
+  const results = searchSessions(sessions, query);
+  const isSearching = query.trim().length > 0;
 
   // Focus/select the inline rename field as soon as it appears.
   useEffect(() => {
@@ -130,17 +136,51 @@ export function ChatSidebar({
           </button>
         </div>
 
+        {/* Search across titles and message text */}
+        <div className="px-3 pb-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search chats…"
+              aria-label="Search conversations"
+              className="w-full rounded-xl border border-white/10 bg-black/20 py-2 pl-9 pr-8 text-sm text-white placeholder:text-slate-500 outline-none transition-colors focus:border-violet-500/50 [&::-webkit-search-cancel-button]:hidden"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                aria-label="Clear search"
+                className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
         {/* Session list */}
         <div className="flex-1 space-y-1 overflow-y-auto px-3 py-2 scrollbar-thin">
-          {ordered.length === 0 && (
+          {results.length === 0 && (
             <p className="px-3 py-6 text-center text-xs text-slate-500">
-              No conversations yet.
+              {isSearching
+                ? "No conversations match your search."
+                : "No conversations yet."}
             </p>
           )}
 
-          {ordered.map((session) => {
+          {isSearching && results.length > 0 && (
+            <p className="px-2 pb-1 text-[11px] text-slate-500">
+              {results.length} conversation{results.length === 1 ? "" : "s"} found
+            </p>
+          )}
+
+          {results.map(({ session, snippet, matchCount }) => {
             const isActive = session.id === activeId;
             const isEditing = session.id === editingId;
+            const isStreaming = streamingIds?.has(session.id) ?? false;
 
             return (
               <div
@@ -191,17 +231,36 @@ export function ChatSidebar({
                       title={session.title}
                       className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
                     >
-                      <span
-                        className={cn(
-                          "w-full truncate text-sm",
-                          isActive ? "text-white" : "text-slate-300"
+                      <span className="flex w-full items-center gap-1.5">
+                        {isStreaming && (
+                          <span
+                            aria-label="Response in progress"
+                            className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-violet-400"
+                          />
                         )}
-                      >
-                        {session.title}
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-sm",
+                            isActive ? "text-white" : "text-slate-300"
+                          )}
+                        >
+                          {session.title}
+                        </span>
+                        {isSearching && matchCount > 1 && (
+                          <span className="shrink-0 rounded-full bg-white/10 px-1.5 text-[10px] text-slate-400">
+                            {matchCount}
+                          </span>
+                        )}
                       </span>
-                      <span className="text-[11px] text-slate-500">
-                        {formatRelativeTime(session.updatedAt)}
-                      </span>
+                      {isSearching && snippet ? (
+                        <span className="line-clamp-2 text-[11px] leading-snug text-slate-500">
+                          {snippet}
+                        </span>
+                      ) : (
+                        <span className="text-[11px] text-slate-500">
+                          {formatRelativeTime(session.updatedAt)}
+                        </span>
+                      )}
                     </button>
 
                     <div

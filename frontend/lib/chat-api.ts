@@ -54,13 +54,32 @@ function parseEvent(rawEvent: string): SSEEvent | null {
   }
 }
 
+export interface StreamOptions {
+  /** Aborts the in-flight request. Rejects with an AbortError. */
+  signal?: AbortSignal;
+}
+
+/** True for the error a fetch/stream raises when its AbortSignal fires. */
+export function isAbortError(error: unknown): boolean {
+  if (typeof error === "object" && error !== null) {
+    const name = (error as { name?: unknown }).name;
+    if (name === "AbortError") return true;
+  }
+  return (
+    typeof DOMException !== "undefined" &&
+    error instanceof DOMException &&
+    error.name === "AbortError"
+  );
+}
+
 /**
  * Sends a chat message and returns a ReadableStream of SSE events.
  * The caller should iterate over events using an async for loop.
  */
 export async function streamChat(
   message: string,
-  chatHistory: ChatMessage[]
+  chatHistory: ChatMessage[],
+  options: StreamOptions = {}
 ): Promise<ReadableStream<SSEEvent>> {
   const response = await fetch(`${API_BASE}/chat`, {
     method: "POST",
@@ -69,6 +88,7 @@ export async function streamChat(
       message,
       chat_history: chatHistory,
     }),
+    signal: options.signal,
   });
 
   if (!response.ok) {
@@ -136,6 +156,10 @@ export async function streamChat(
 /**
  * Helper to consume the SSE stream with callbacks.
  * This is the main function used by the ChatWidget component.
+ *
+ * Pass an AbortSignal through `options` to cancel the response: the promise
+ * resolves without calling `onError` so the caller can mark the message as
+ * cancelled. Callbacks are never invoked after an abort.
  */
 export async function sendMessage(
   message: string,
@@ -143,13 +167,21 @@ export async function sendMessage(
   onTextChunk: (chunk: string) => void,
   onProducts: (products: Product[]) => void,
   onDone: (route: string) => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
+  options: StreamOptions = {}
 ): Promise<void> {
+  const { signal } = options;
+
   try {
-    const stream = await streamChat(message, chatHistory);
+    const stream = await streamChat(message, chatHistory, options);
     const reader = stream.getReader();
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => {});
+        return;
+      }
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -169,6 +201,8 @@ export async function sendMessage(
       }
     }
   } catch (err) {
+    // A cancelled request is not an error: let the caller decide what to show.
+    if (isAbortError(err) || signal?.aborted) return;
     onError(
       err instanceof Error
         ? `Connection error: ${err.message}`
