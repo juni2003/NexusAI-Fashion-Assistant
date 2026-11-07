@@ -34,6 +34,27 @@ export interface SSEEvent {
 }
 
 /**
+ * Parses a single complete SSE event block (already split on the blank line
+ * delimiter) into an SSEEvent. Returns null for comments/heartbeats or
+ * malformed payloads. Multiple `data:` lines are joined with newlines, as the
+ * SSE spec requires.
+ */
+function parseEvent(rawEvent: string): SSEEvent | null {
+  const dataLines = rawEvent
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.replace(/^data:\s?/, ""));
+
+  if (dataLines.length === 0) return null;
+
+  try {
+    return JSON.parse(dataLines.join("\n")) as SSEEvent;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Sends a chat message and returns a ReadableStream of SSE events.
  * The caller should iterate over events using an async for loop.
  */
@@ -57,40 +78,56 @@ export async function streamChat(
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
 
+  // Persists for the lifetime of the stream so an event split across two
+  // network reads is reassembled instead of being lost.
+  let buffer = "";
+
+  const enqueueEvent = (
+    controller: ReadableStreamDefaultController<SSEEvent>,
+    event: SSEEvent | null
+  ): boolean => {
+    if (!event) return false;
+    controller.enqueue(event);
+    return event.type === "done" || event.type === "error";
+  };
+
+  const flushBuffer = (
+    controller: ReadableStreamDefaultController<SSEEvent>
+  ): void => {
+    // Decoder flush: emit any multi-byte character held back at the boundary.
+    buffer += decoder.decode();
+    const finalEvent = parseEvent(buffer);
+    buffer = "";
+    enqueueEvent(controller, finalEvent);
+    controller.close();
+  };
+
   return new ReadableStream<SSEEvent>({
     async pull(controller) {
-      let buffer = "";
-
       while (true) {
+        // Parse every complete event currently sitting in the buffer. Events
+        // are delimited by a blank line (\n\n, tolerating \r\n\r\n). Anything
+        // after the last delimiter is incomplete and stays buffered.
+        const boundary = buffer.match(/\r?\n\r?\n/);
+        if (boundary && boundary.index !== undefined) {
+          const rawEvent = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary[0].length);
+
+          if (enqueueEvent(controller, parseEvent(rawEvent))) {
+            controller.close();
+            return;
+          }
+          continue;
+        }
+
         const { done, value } = await reader.read();
 
         if (done) {
-          controller.close();
+          flushBuffer(controller);
           return;
         }
 
         buffer += decoder.decode(value, { stream: true });
-
-        // SSE events are separated by double newlines
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || ""; // keep incomplete last chunk
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data: ")) continue;
-
-          try {
-            const json = JSON.parse(trimmed.slice(6)) as SSEEvent;
-            controller.enqueue(json);
-
-            if (json.type === "done" || json.type === "error") {
-              controller.close();
-              return;
-            }
-          } catch {
-            // Skip malformed events
-          }
-        }
       }
     },
   });
