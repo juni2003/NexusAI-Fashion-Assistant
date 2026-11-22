@@ -74,7 +74,7 @@ class AgentState(TypedDict):
 def call_groq(messages: list[dict], temperature: float = 0.3) -> str:
     client = get_groq()
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="llama3-8b-8192", # Using a common Groq-native model
         messages=messages,
         temperature=temperature,
         max_tokens=1024,
