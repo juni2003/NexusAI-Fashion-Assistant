@@ -29,10 +29,19 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Allow all origins in development. In production, replace "*" with your Vercel URL.
+# Configure allowed origins. In production, set CORS_ORIGINS environment variable
+# to a comma-separated list of your frontend URLs (e.g., "https://your-frontend.vercel.app").
+# Defaults to "*" for development convenience if not set.
+import os
+cors_origins_env = os.getenv("CORS_ORIGINS")
+if cors_origins_env:
+    allow_origins = [origin.strip() for origin in cors_origins_env.split(',')]
+else:
+    allow_origins = ["*"] # Default to allow all for development if not specified
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
