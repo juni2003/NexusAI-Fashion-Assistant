@@ -66,12 +66,12 @@ def search_products(query_embedding: list[float], top_k: int = 15) -> list[dict]
 
 def search_support(query_embedding: list[float], top_k: int = 5) -> list[dict]:
     """
-    Calls the match_support_docs Postgres function via Supabase RPC.
-    Returns up to top_k support document chunks ordered by cosine similarity.
+    Calls the match_support Postgres function via Supabase RPC.
+    Returns up to top_k support documents ordered by cosine similarity.
     """
     client = get_supabase()
     response = client.rpc(
-        "match_support_docs",
+        "match_support",
         {"query_embedding": query_embedding, "match_count": top_k}
     ).execute()
 
